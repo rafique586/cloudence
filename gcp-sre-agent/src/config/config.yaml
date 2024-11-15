@@ -1,0 +1,38 @@
+# config.yaml
+vertex_ai:
+  endpoint_name: "sre-agent-endpoint"
+  model_name: "text-bison@001"
+
+kubernetes:
+  regions:
+    - "us-central1"
+    - "us-east1"
+    - "europe-west1"
+    # Add more regions as needed
+  check_interval_seconds: 300
+
+logging:
+  error_codes:
+    - 400
+    - 401
+    - 403
+    - 404
+    - 500
+    - 502
+    - 503
+    - 504
+  max_entries: 100
+  check_interval_seconds: 300
+
+monitoring:
+  interval_seconds: 3600
+  dashboards:
+    - name: "Cluster Overview"
+      metric_types:
+        - "kubernetes.io/container/cpu/core_usage_time"
+        - "kubernetes.io/container/memory/used_bytes"
+    - name: "Network Performance"
+      metric_types:
+        - "kubernetes.io/container/network/received_bytes_count"
+        - "kubernetes.io/container/network/sent_bytes_count"
+    # Add more dashboards as needed

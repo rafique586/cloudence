@@ -1,0 +1,29 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+      - ~/.config/gcloud:/root/.config/gcloud
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+    ports:
+      - "8000:8000"
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    volumes:
+      - ./src/ui:/app/src
+    ports:
+      - "3000:3000"
+    environment:
+      - API_URL=http://agent:8000
+    command: npm run dev
