@@ -1,0 +1,351 @@
+from kubernetes import client, config, watch
+from kubernetes.client import CustomObjectsApi
+from typing import List, Dict, Optional, Callable, Any, Union
+from dataclasses import dataclass
+import yaml
+import json
+from datetime import datetime
+import re
+
+@dataclass
+class CRDFilter:
+    """Data class for CRD filtering options"""
+    namespace: str = None  # None for cluster-wide resources
+    label_selector: str = None
+    field_selector: str = None
+    name_pattern: str = None
+    resource_version: str = None
+    timeout_seconds: int = None
+
+class K8sCRDOperations:
+    def __init__(self, context: str = None):
+        """
+        Initialize Kubernetes client for CRD operations
+        Args:
+            context (str): Kubernetes context name (optional)
+        """
+        if context:
+            config.load_kube_config(context=context)
+        else:
+            config.load_kube_config()
+        
+        self.custom_objects = CustomObjectsApi()
+        self.api_client = client.ApiClient()
+        self.api_instance = client.ApiextensionsV1Api()
+
+    def list_crds(self, name_pattern: str = None) -> List[Dict]:
+        """
+        List all Custom Resource Definitions in the cluster
+        Args:
+            name_pattern (str): Regex pattern to filter CRD names
+        Returns:
+            List[Dict]: List of CRD information
+        """
+        try:
+            crds = self.api_instance.list_custom_resource_definition()
+            
+            filtered_crds = []
+            for crd in crds.items:
+                if name_pattern and not re.search(name_pattern, crd.metadata.name):
+                    continue
+                
+                versions = []
+                for version in crd.spec.versions:
+                    versions.append({
+                        'name': version.name,
+                        'served': version.served,
+                        'storage': version.storage,
+                        'schema': version.schema.open_api_v3_schema if version.schema else None
+                    })
+                
+                crd_info = {
+                    'name': crd.metadata.name,
+                    'group': crd.spec.group,
+                    'scope': crd.spec.scope,
+                    'versions': versions,
+                    'names': {
+                        'plural': crd.spec.names.plural,
+                        'singular': crd.spec.names.singular,
+                        'kind': crd.spec.names.kind,
+                        'shortNames': crd.spec.names.short_names if hasattr(crd.spec.names, 'short_names') else []
+                    }
+                }
+                filtered_crds.append(crd_info)
+            
+            return filtered_crds
+            
+        except Exception as e:
+            print(f"Error listing CRDs: {str(e)}")
+            return []
+
+    def get_custom_resources(self, 
+                           group: str,
+                           version: str,
+                           plural: str,
+                           filter_opts: CRDFilter = None) -> List[Dict]:
+        """
+        Get custom resources of a specific CRD
+        Args:
+            group (str): API group of the CRD
+            version (str): API version of the CRD
+            plural (str): Plural name of the CRD
+            filter_opts (CRDFilter): Filter options
+        Returns:
+            List[Dict]: List of custom resources
+        """
+        if filter_opts is None:
+            filter_opts = CRDFilter()
+
+        try:
+            if filter_opts.namespace:
+                # Namespaced resources
+                resources = self.custom_objects.list_namespaced_custom_object(
+                    group=group,
+                    version=version,
+                    namespace=filter_opts.namespace,
+                    plural=plural,
+                    label_selector=filter_opts.label_selector,
+                    field_selector=filter_opts.field_selector,
+                )
+            else:
+                # Cluster-wide resources
+                resources = self.custom_objects.list_cluster_custom_object(
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    label_selector=filter_opts.label_selector,
+                    field_selector=filter_opts.field_selector,
+                )
+
+            if not resources.get('items'):
+                return []
+
+            filtered_resources = []
+            for resource in resources['items']:
+                if filter_opts.name_pattern and not re.search(
+                    filter_opts.name_pattern, 
+                    resource['metadata']['name']
+                ):
+                    continue
+                filtered_resources.append(resource)
+
+            return filtered_resources
+
+        except Exception as e:
+            print(f"Error getting custom resources: {str(e)}")
+            return []
+
+    def watch_custom_resources(self,
+                             group: str,
+                             version: str,
+                             plural: str,
+                             callback: Callable[[str, Any], None],
+                             filter_opts: CRDFilter = None):
+        """
+        Watch custom resources and call callback function on changes
+        Args:
+            group (str): API group of the CRD
+            version (str): API version of the CRD
+            plural (str): Plural name of the CRD
+            callback (Callable): Callback function(event_type, resource)
+            filter_opts (CRDFilter): Filter options
+        """
+        if filter_opts is None:
+            filter_opts = CRDFilter()
+
+        w = watch.Watch()
+        
+        try:
+            if filter_opts.namespace:
+                stream = w.stream(
+                    self.custom_objects.list_namespaced_custom_object,
+                    group=group,
+                    version=version,
+                    namespace=filter_opts.namespace,
+                    plural=plural,
+                    label_selector=filter_opts.label_selector,
+                    field_selector=filter_opts.field_selector,
+                    resource_version=filter_opts.resource_version,
+                    timeout_seconds=filter_opts.timeout_seconds
+                )
+            else:
+                stream = w.stream(
+                    self.custom_objects.list_cluster_custom_object,
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    label_selector=filter_opts.label_selector,
+                    field_selector=filter_opts.field_selector,
+                    resource_version=filter_opts.resource_version,
+                    timeout_seconds=filter_opts.timeout_seconds
+                )
+
+            for event in stream:
+                callback(event['type'], event['object'])
+
+        except Exception as e:
+            print(f"Error watching custom resources: {str(e)}")
+        finally:
+            w.stop()
+
+    def create_custom_resource(self,
+                             group: str,
+                             version: str,
+                             plural: str,
+                             body: Dict,
+                             namespace: str = None) -> Dict:
+        """
+        Create a custom resource
+        Args:
+            group (str): API group of the CRD
+            version (str): API version of the CRD
+            plural (str): Plural name of the CRD
+            body (Dict): Custom resource definition body
+            namespace (str): Namespace (optional for cluster-wide resources)
+        Returns:
+            Dict: Created custom resource
+        """
+        try:
+            if namespace:
+                return self.custom_objects.create_namespaced_custom_object(
+                    group=group,
+                    version=version,
+                    namespace=namespace,
+                    plural=plural,
+                    body=body
+                )
+            else:
+                return self.custom_objects.create_cluster_custom_object(
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    body=body
+                )
+        except Exception as e:
+            print(f"Error creating custom resource: {str(e)}")
+            return None
+
+    def delete_custom_resource(self,
+                             group: str,
+                             version: str,
+                             plural: str,
+                             name: str,
+                             namespace: str = None) -> Dict:
+        """
+        Delete a custom resource
+        Args:
+            group (str): API group of the CRD
+            version (str): API version of the CRD
+            plural (str): Plural name of the CRD
+            name (str): Name of the custom resource
+            namespace (str): Namespace (optional for cluster-wide resources)
+        Returns:
+            Dict: Deletion status
+        """
+        try:
+            if namespace:
+                return self.custom_objects.delete_namespaced_custom_object(
+                    group=group,
+                    version=version,
+                    namespace=namespace,
+                    plural=plural,
+                    name=name
+                )
+            else:
+                return self.custom_objects.delete_cluster_custom_object(
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    name=name
+                )
+        except Exception as e:
+            print(f"Error deleting custom resource: {str(e)}")
+            return None
+
+    def patch_custom_resource(self,
+                            group: str,
+                            version: str,
+                            plural: str,
+                            name: str,
+                            patch: Dict,
+                            namespace: str = None) -> Dict:
+        """
+        Patch a custom resource
+        Args:
+            group (str): API group of the CRD
+            version (str): API version of the CRD
+            plural (str): Plural name of the CRD
+            name (str): Name of the custom resource
+            patch (Dict): Patch body
+            namespace (str): Namespace (optional for cluster-wide resources)
+        Returns:
+            Dict: Patched custom resource
+        """
+        try:
+            if namespace:
+                return self.custom_objects.patch_namespaced_custom_object(
+                    group=group,
+                    version=version,
+                    namespace=namespace,
+                    plural=plural,
+                    name=name,
+                    body=patch
+                )
+            else:
+                return self.custom_objects.patch_cluster_custom_object(
+                    group=group,
+                    version=version,
+                    plural=plural,
+                    name=name,
+                    body=patch
+                )
+        except Exception as e:
+            print(f"Error patching custom resource: {str(e)}")
+            return None
+
+def main():
+    # Example usage
+    crd_ops = K8sCRDOperations()
+    
+    # List all CRDs
+    crds = crd_ops.list_crds(name_pattern=".*istio.*")
+    print("Found CRDs:", json.dumps(crds, indent=2))
+    
+    # Example watching custom resources
+    def handle_custom_resource_event(event_type: str, resource: Any):
+        print(f"Event {event_type} for {resource['metadata']['name']}")
+    
+    # Create filter options
+    filter_opts = CRDFilter(
+        namespace='default',
+        label_selector='app=custom-app',
+        name_pattern='test-.*'
+    )
+    
+    # Example with VirtualService CRD from Istio
+    group = "networking.istio.io"
+    version = "v1alpha3"
+    plural = "virtualservices"
+    
+    # Get custom resources
+    resources = crd_ops.get_custom_resources(
+        group=group,
+        version=version,
+        plural=plural,
+        filter_opts=filter_opts
+    )
+    print("Custom Resources:", json.dumps(resources, indent=2))
+    
+    # Watch custom resources
+    print("Watching custom resources...")
+    crd_ops.watch_custom_resources(
+        group=group,
+        version=version,
+        plural=plural,
+        callback=handle_custom_resource_event,
+        filter_opts=filter_opts
+    )
+
+if __name__ == "__main__":
+    main()
+Last edited 5 minutes ago
