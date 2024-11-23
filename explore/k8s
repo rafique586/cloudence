@@ -1,0 +1,311 @@
+from kubernetes import client, config, watch
+from kubernetes.client import CustomObjectsApi
+from typing import List, Dict, Optional, Callable, Any
+from datetime import datetime, timedelta
+import re
+import time
+from dataclasses import dataclass
+from prometheus_api_client import PrometheusConnect
+
+@dataclass
+class ResourceFilter:
+    """Data class for resource filtering options"""
+    namespace: str = 'default'
+    label_selector: str = None
+    field_selector: str = None
+    name_pattern: str = None
+    resource_version: str = None
+    timeout_seconds: int = None
+
+class K8sMetricsCollector:
+    """Class for collecting Kubernetes metrics"""
+    def __init__(self, prometheus_url: str):
+        self.prom = PrometheusConnect(url=prometheus_url, disable_ssl=True)
+
+    def get_pod_metrics(self, namespace: str, pod_name: str) -> Dict:
+        """Get pod metrics from Prometheus"""
+        queries = {
+            'cpu_usage': f'sum(rate(container_cpu_usage_seconds_total{{namespace="{namespace}",pod="{pod_name}"}}[5m]))',
+            'memory_usage': f'sum(container_memory_usage_bytes{{namespace="{namespace}",pod="{pod_name}"}}) / 1024^2',
+            'network_receive': f'sum(rate(container_network_receive_bytes_total{{namespace="{namespace}",pod="{pod_name}"}}[5m]))',
+            'network_transmit': f'sum(rate(container_network_transmit_bytes_total{{namespace="{namespace}",pod="{pod_name}"}}[5m]))'
+        }
+        
+        metrics = {}
+        for metric_name, query in queries.items():
+            try:
+                result = self.prom.custom_query(query=query)
+                metrics[metric_name] = float(result[0]['value'][1]) if result else 0
+            except Exception as e:
+                metrics[metric_name] = f"Error: {str(e)}"
+        
+        return metrics
+
+class K8sOperations:
+    def __init__(self, context: str = None, prometheus_url: str = None):
+        """
+        Initialize Kubernetes client with optional metrics collection
+        """
+        if context:
+            config.load_kube_config(context=context)
+        else:
+            config.load_kube_config()
+        
+        self.core_v1 = client.CoreV1Api()
+        self.apps_v1 = client.AppsV1Api()
+        self.batch_v1 = client.BatchV1Api()
+        self.networking_v1 = client.NetworkingV1Api()
+        self.rbac_v1 = client.RbacAuthorizationV1Api()
+        self.storage_v1 = client.StorageV1Api()
+        self.custom_objects = CustomObjectsApi()
+        
+        self.metrics_collector = K8sMetricsCollector(prometheus_url) if prometheus_url else None
+
+    def watch_resource(self, resource_type: str, callback: Callable[[str, Any], None], 
+                      filter_opts: ResourceFilter = None):
+        """
+        Watch Kubernetes resources and call callback function on changes
+        Args:
+            resource_type: Type of resource to watch
+            callback: Callback function(event_type, resource)
+            filter_opts: ResourceFilter object for filtering
+        """
+        if filter_opts is None:
+            filter_opts = ResourceFilter()
+
+        w = watch.Watch()
+        
+        resource_funcs = {
+            'pods': self.core_v1.list_namespaced_pod,
+            'deployments': self.apps_v1.list_namespaced_deployment,
+            'statefulsets': self.apps_v1.list_namespaced_stateful_set,
+            'daemonsets': self.apps_v1.list_namespaced_daemon_set,
+            'services': self.core_v1.list_namespaced_service,
+            'pvcs': self.core_v1.list_namespaced_persistent_volume_claim,
+            'pvs': self.core_v1.list_persistent_volume,
+        }
+
+        func = resource_funcs.get(resource_type)
+        if not func:
+            raise ValueError(f"Unsupported resource type: {resource_type}")
+
+        try:
+            for event in w.stream(
+                func,
+                namespace=filter_opts.namespace,
+                label_selector=filter_opts.label_selector,
+                field_selector=filter_opts.field_selector,
+                resource_version=filter_opts.resource_version,
+                timeout_seconds=filter_opts.timeout_seconds
+            ):
+                callback(event['type'], event['object'])
+        except Exception as e:
+            print(f"Error watching {resource_type}: {str(e)}")
+        finally:
+            w.stop()
+
+    def get_statefulsets(self, filter_opts: ResourceFilter = None) -> List[Dict]:
+        """Get StatefulSets with filtering options"""
+        if filter_opts is None:
+            filter_opts = ResourceFilter()
+
+        try:
+            statefulsets = self.apps_v1.list_namespaced_stateful_set(
+                namespace=filter_opts.namespace,
+                label_selector=filter_opts.label_selector,
+                field_selector=filter_opts.field_selector
+            )
+            
+            filtered_statefulsets = []
+            for sts in statefulsets.items:
+                if filter_opts.name_pattern and not re.search(filter_opts.name_pattern, sts.metadata.name):
+                    continue
+                    
+                sts_info = {
+                    'name': sts.metadata.name,
+                    'namespace': sts.metadata.namespace,
+                    'replicas': {
+                        'desired': sts.spec.replicas,
+                        'ready': sts.status.ready_replicas,
+                        'current': sts.status.current_replicas
+                    },
+                    'update_strategy': sts.spec.update_strategy.type,
+                    'volume_claims': [
+                        {
+                            'name': vc.name,
+                            'storage_class': vc.persistent_volume_claim.storage_class_name
+                        } for vc in sts.spec.volume_claim_templates
+                    ] if sts.spec.volume_claim_templates else []
+                }
+                filtered_statefulsets.append(sts_info)
+                
+            return filtered_statefulsets
+            
+        except Exception as e:
+            print(f"Error getting StatefulSets: {str(e)}")
+            return []
+
+    def get_daemonsets(self, filter_opts: ResourceFilter = None) -> List[Dict]:
+        """Get DaemonSets with filtering options"""
+        if filter_opts is None:
+            filter_opts = ResourceFilter()
+
+        try:
+            daemonsets = self.apps_v1.list_namespaced_daemon_set(
+                namespace=filter_opts.namespace,
+                label_selector=filter_opts.label_selector,
+                field_selector=filter_opts.field_selector
+            )
+            
+            filtered_daemonsets = []
+            for ds in daemonsets.items:
+                if filter_opts.name_pattern and not re.search(filter_opts.name_pattern, ds.metadata.name):
+                    continue
+                    
+                ds_info = {
+                    'name': ds.metadata.name,
+                    'namespace': ds.metadata.namespace,
+                    'status': {
+                        'desired': ds.status.desired_number_scheduled,
+                        'current': ds.status.current_number_scheduled,
+                        'ready': ds.status.number_ready,
+                        'up_to_date': ds.status.updated_number_scheduled
+                    },
+                    'update_strategy': ds.spec.update_strategy.type,
+                }
+                filtered_daemonsets.append(ds_info)
+                
+            return filtered_daemonsets
+            
+        except Exception as e:
+            print(f"Error getting DaemonSets: {str(e)}")
+            return []
+
+    def get_persistent_volumes(self, filter_opts: ResourceFilter = None) -> List[Dict]:
+        """Get Persistent Volumes with filtering options"""
+        if filter_opts is None:
+            filter_opts = ResourceFilter()
+
+        try:
+            pvs = self.core_v1.list_persistent_volume(
+                label_selector=filter_opts.label_selector,
+                field_selector=filter_opts.field_selector
+            )
+            
+            filtered_pvs = []
+            for pv in pvs.items:
+                if filter_opts.name_pattern and not re.search(filter_opts.name_pattern, pv.metadata.name):
+                    continue
+                    
+                pv_info = {
+                    'name': pv.metadata.name,
+                    'capacity': pv.spec.capacity.get('storage'),
+                    'access_modes': pv.spec.access_modes,
+                    'reclaim_policy': pv.spec.persistent_volume_reclaim_policy,
+                    'status': pv.status.phase,
+                    'storage_class': pv.spec.storage_class_name,
+                    'claim_ref': {
+                        'namespace': pv.spec.claim_ref.namespace,
+                        'name': pv.spec.claim_ref.name
+                    } if pv.spec.claim_ref else None
+                }
+                filtered_pvs.append(pv_info)
+                
+            return filtered_pvs
+            
+        except Exception as e:
+            print(f"Error getting Persistent Volumes: {str(e)}")
+            return []
+
+    def get_persistent_volume_claims(self, filter_opts: ResourceFilter = None) -> List[Dict]:
+        """Get Persistent Volume Claims with filtering options"""
+        if filter_opts is None:
+            filter_opts = ResourceFilter()
+
+        try:
+            pvcs = self.core_v1.list_namespaced_persistent_volume_claim(
+                namespace=filter_opts.namespace,
+                label_selector=filter_opts.label_selector,
+                field_selector=filter_opts.field_selector
+            )
+            
+            filtered_pvcs = []
+            for pvc in pvcs.items:
+                if filter_opts.name_pattern and not re.search(filter_opts.name_pattern, pvc.metadata.name):
+                    continue
+                    
+                pvc_info = {
+                    'name': pvc.metadata.name,
+                    'namespace': pvc.metadata.namespace,
+                    'status': pvc.status.phase,
+                    'volume_name': pvc.spec.volume_name,
+                    'storage_class': pvc.spec.storage_class_name,
+                    'access_modes': pvc.spec.access_modes,
+                    'capacity': pvc.status.capacity.get('storage') if pvc.status.capacity else None,
+                }
+                filtered_pvcs.append(pvc_info)
+                
+            return filtered_pvcs
+            
+        except Exception as e:
+            print(f"Error getting Persistent Volume Claims: {str(e)}")
+            return []
+
+    def get_resource_metrics(self, resource_type: str, namespace: str, name: str) -> Dict:
+        """
+        Get metrics for a specific resource
+        Args:
+            resource_type: Type of resource (pod, deployment, etc.)
+            namespace: Resource namespace
+            name: Resource name
+        Returns:
+            Dict: Collected metrics
+        """
+        if not self.metrics_collector:
+            return {"error": "Metrics collector not initialized"}
+
+        if resource_type == 'pod':
+            return self.metrics_collector.get_pod_metrics(namespace, name)
+        else:
+            return {"error": f"Metrics collection not implemented for {resource_type}"}
+
+def main():
+    # Example usage with resource watching
+    def handle_resource_event(event_type: str, resource: Any):
+        print(f"Event: {event_type} - Resource: {resource.metadata.name}")
+
+    # Initialize K8s operations with Prometheus metrics
+    k8s = K8sOperations(prometheus_url="http://prometheus:9090")
+    
+    # Create filter options
+    filter_opts = ResourceFilter(
+        namespace='default',
+        label_selector='app=myapp',
+        name_pattern='web-.*'
+    )
+
+    # Watch pods
+    print("Watching pods...")
+    k8s.watch_resource('pods', handle_resource_event, filter_opts)
+
+    # Get StatefulSets
+    statefulsets = k8s.get_statefulsets(filter_opts)
+    print("StatefulSets:", statefulsets)
+    
+    # Get DaemonSets
+    daemonsets = k8s.get_daemonsets(filter_opts)
+    print("DaemonSets:", daemonsets)
+    
+    # Get PVs and PVCs
+    pvs = k8s.get_persistent_volumes(filter_opts)
+    print("Persistent Volumes:", pvs)
+    
+    pvcs = k8s.get_persistent_volume_claims(filter_opts)
+    print("Persistent Volume Claims:", pvcs)
+    
+    # Get metrics for a specific pod
+    pod_metrics = k8s.get_resource_metrics('pod', 'default', 'my-pod')
+    print("Pod Metrics:", pod_metrics)
+
+if __name__ == "__main__":
+    main()
