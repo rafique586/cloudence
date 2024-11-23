@@ -1,0 +1,12 @@
+google-cloud-container>=2.21.0
+google-cloud-monitoring>=2.14.1
+google-cloud-logging>=3.5.0
+google-auth>=2.17.3
+pyyaml>=6.0.1
+aiohttp>=3.8.4
+pandas>=1.5.3
+numpy>=1.24.3
+prometheus-client>=0.17.1
+pytest>=7.3.1
+pylint>=2.17.3
+black>=23.3.0
