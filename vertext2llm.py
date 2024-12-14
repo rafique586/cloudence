@@ -7,7 +7,7 @@ import json
 
 def get_k8s_metrics(project_id, cluster_name, interval_minutes=60):
     """
-    Query multiple Kubernetes metrics from Cloud Monitoring
+    Query multiple Kubernetes metrics from Cloud Monitoring with proper pagination
     """
     client = monitoring_v3.MetricServiceClient()
     project_name = f"projects/{project_id}"
@@ -32,30 +32,62 @@ def get_k8s_metrics(project_id, cluster_name, interval_minutes=60):
     all_metrics = {}
     
     for metric_type in metric_types:
-        query = {
-            "name": project_name,
-            "filter": f'resource.type="k8s_container" AND resource.labels.cluster_name="{cluster_name}"'
-                     f' AND metric.type="{metric_type}"',
-            "interval": interval,
-            "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
-        }
-        
         metric_name = metric_type.split('/')[-1]
         all_metrics[metric_name] = []
         
         try:
-            page_result = client.list_time_series(request=query)
-            for time_series in page_result:
-                for point in time_series.points:
-                    all_metrics[metric_name].append({
-                        'timestamp': point.interval.end_time.timestamp(),
-                        'value': point.value.double_value if hasattr(point.value, 'double_value') else point.value.int64_value,
-                        'container': time_series.resource.labels['container_name'],
-                        'namespace': time_series.resource.labels['namespace_name'],
-                        'pod': time_series.resource.labels['pod_name']
-                    })
+            request = monitoring_v3.ListTimeSeriesRequest(
+                name=project_name,
+                filter=f'resource.type="k8s_container" AND resource.labels.cluster_name="{cluster_name}"'
+                       f' AND metric.type="{metric_type}"',
+                interval=interval,
+                view=monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+            )
+            
+            # Handle pagination
+            while True:
+                try:
+                    page_result = client.list_time_series(request=request)
+                    
+                    for time_series in page_result:
+                        # Extract labels once per time series
+                        resource_labels = {
+                            'container': time_series.resource.labels['container_name'],
+                            'namespace': time_series.resource.labels['namespace_name'],
+                            'pod': time_series.resource.labels['pod_name']
+                        }
+                        
+                        # Process all points for this time series
+                        metrics = [
+                            {
+                                'timestamp': point.interval.end_time.timestamp(),
+                                'value': point.value.double_value if hasattr(point.value, 'double_value') 
+                                        else point.value.int64_value,
+                                **resource_labels
+                            }
+                            for point in time_series.points
+                        ]
+                        
+                        all_metrics[metric_name].extend(metrics)
+                    
+                    # Check if there are more pages
+                    next_page_token = page_result.next_page_token
+                    if not next_page_token:
+                        break
+                        
+                    # Update the request with the next page token
+                    request.page_token = next_page_token
+                    
+                except Exception as e:
+                    print(f"Error processing page for {metric_type}: {str(e)}")
+                    break
+                    
         except Exception as e:
             print(f"Error collecting {metric_type}: {str(e)}")
+            continue
+        
+        # Log the number of data points collected
+        print(f"Collected {len(all_metrics[metric_name])} data points for {metric_name}")
     
     return all_metrics
 
